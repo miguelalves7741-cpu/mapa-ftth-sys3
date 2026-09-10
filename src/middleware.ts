@@ -12,7 +12,10 @@ export function middleware(req: NextRequest) {
   if (basicAuth) {
     const authValue = basicAuth.split(' ')[1];
     // Decodifica a string base64: "usuario:senha"
-    const [user, pwd] = atob(authValue).split(':');
+    const decoded = atob(authValue);
+    const index = decoded.indexOf(':');
+    const user = decoded.slice(0, index);
+    const pwd = decoded.slice(index + 1);
 
     // Se bater com o nosso usuário e senha, libera o acesso
     if (user === USER && pwd === PASS) {
