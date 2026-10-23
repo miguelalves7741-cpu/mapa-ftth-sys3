@@ -43,6 +43,13 @@ body {
 /* Leaflet Customizations */
 .leaflet-container {
   font-family: inherit;
+  background-color: #0f172a;
+}
+.leaflet-layer,
+.leaflet-control-zoom-in,
+.leaflet-control-zoom-out,
+.leaflet-control-attribution {
+  filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(90%);
 }
 .custom-popup .leaflet-popup-content-wrapper {
   background: rgba(255, 255, 255, 0.95);
