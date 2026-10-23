@@ -689,7 +689,17 @@ export default function DashboardLayout() {
           ) : viewMode === 'MAPA' ? (
             <div className="space-y-3">
               <div className="h-[calc(100vh-420px)] min-h-[460px] rounded-2xl overflow-hidden border border-slate-800/80 shadow-xl">
-                <MapComponent onus={displayedOnus} ctos={ctos} />
+                <MapComponent
+                  onus={displayedOnus}
+                  ctos={ctos}
+                  escopo={escopo}
+                  onChangeEscopo={setEscopo}
+                  onSelectPon={(slot, pon) => {
+                    setSelectedSlot(String(slot));
+                    setSelectedPon(String(pon));
+                    setEscopo('pon');
+                  }}
+                />
               </div>
 
               {/* Legenda */}
