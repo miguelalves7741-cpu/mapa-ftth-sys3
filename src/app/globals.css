@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #000000;
+  --foreground: #ffffff;
 }
 
 @theme inline {
@@ -12,16 +12,9 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
-  background: var(--background);
-  color: var(--foreground);
+  background: #000000;
+  color: #ffffff;
   font-family: Arial, Helvetica, sans-serif;
 }
 
@@ -33,17 +26,17 @@ body {
   background: transparent;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb {
-  background-color: rgba(71, 85, 105, 0.5); /* slate-600 with opacity */
+  background-color: rgba(235, 100, 16, 0.45);
   border-radius: 10px;
 }
 .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(71, 85, 105, 0.8);
+  background-color: rgba(232, 72, 24, 0.8);
 }
 
 /* Leaflet Customizations */
 .leaflet-container {
   font-family: inherit;
-  background-color: #0f172a;
+  background-color: #000000;
 }
 .leaflet-layer,
 .leaflet-control-zoom-in,

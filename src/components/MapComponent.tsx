@@ -29,6 +29,8 @@ import {
   Globe,
   ChevronDown,
   ChevronUp,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 
 // Leaflet icon fix for Next.js
@@ -114,15 +116,27 @@ function FitBounds({ points, disabled }: { points: [number, number][]; disabled?
   return null;
 }
 
+/** Recalcula as dimensões do Leaflet ao entrar ou sair do modo Tela Cheia. */
+function InvalidateMapSize({ trigger }: { trigger: boolean }) {
+  const map = useMap();
+  useEffect(() => {
+    const id = setTimeout(() => {
+      map.invalidateSize();
+    }, 60);
+    return () => clearTimeout(id);
+  }, [map, trigger]);
+  return null;
+}
+
 export default function MapComponent({
   onus,
-  ctos,
   escopo,
   onChangeEscopo,
   onSelectPon,
 }: MapComponentProps) {
   const [isMounted, setIsMounted] = useState(false);
   const [mapKey, setMapKey] = useState("map-init");
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   // Estados da ferramenta de Análise de Área / Raio
   const [areaToolActive, setAreaToolActive] = useState(false);
@@ -135,10 +149,18 @@ export default function MapComponent({
   useEffect(() => {
     initIconFix();
     setIsMounted(true);
-    // HMR Fix: Atualiza a key para forçar o React-Leaflet a recriar a instância do mapa
-    // durante o Fast Refresh do Next.js, evitando o erro 'appendChild'
     setMapKey(Date.now().toString());
   }, []);
+
+  // Permite sair da tela cheia com a tecla ESC
+  useEffect(() => {
+    if (!isFullscreen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setIsFullscreen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isFullscreen]);
 
   // Só entra no mapa quem realmente tem posição vinda do SGP.
   const plotted = useMemo(
@@ -150,15 +172,13 @@ export default function MapComponent({
 
   const semCoordenada = onus.filter((o) => o.lat === null && !o.aguardandoGeo).length;
 
+  // Enquadramento baseado apenas nos clientes (sem CTOs no mapa)
   const bounds = useMemo<[number, number][]>(
-    () => [
-      ...plotted.map((o) => [o.lat, o.lng] as [number, number]),
-      ...ctos.map((c) => [c.lat, c.lng] as [number, number]),
-    ],
-    [plotted, ctos]
+    () => plotted.map((o) => [o.lat, o.lng] as [number, number]),
+    [plotted]
   );
 
-  // Calcula quais ONUs e CTOs estão dentro da área demarcada (Raio ou Polígono)
+  // Calcula quais ONUs estão dentro da área demarcada (Raio ou Polígono)
   const areaSelection = useMemo(() => {
     if (!areaToolActive) return null;
 
@@ -175,13 +195,6 @@ export default function MapComponent({
         return centerLatLng.distanceTo(L.latLng(o.lat, o.lng)) <= circleRadius;
       }
       return isPointInPolygon([o.lat, o.lng], polygonPoints);
-    });
-
-    const ctosInside = ctos.filter((c) => {
-      if (areaMode === "raio" && centerLatLng) {
-        return centerLatLng.distanceTo(L.latLng(c.lat, c.lng)) <= circleRadius;
-      }
-      return isPointInPolygon([c.lat, c.lng], polygonPoints);
     });
 
     // Agrupa por Slot/PON
@@ -207,11 +220,8 @@ export default function MapComponent({
 
     const pons = Array.from(ponMap.values()).sort((a, b) => b.total - a.total);
 
-    // Agrupa CTOs que atendem os clientes da área (ou que estão fisicamente dentro)
+    // Agrupa CTOs que atendem os clientes da área
     const ctoMap = new Map<string, number>();
-    for (const c of ctosInside) {
-      ctoMap.set(c.ident, 0);
-    }
     for (const o of onusInside) {
       if (o.cto) {
         ctoMap.set(o.cto, (ctoMap.get(o.cto) ?? 0) + 1);
@@ -227,25 +237,23 @@ export default function MapComponent({
 
     return {
       onusInside,
-      ctosInside,
       pons,
       ctosSummary,
       onlineTotal,
       offlineTotal,
       selectedIds,
     };
-  }, [areaToolActive, areaMode, circleCenter, circleRadius, polygonPoints, plotted, ctos]);
+  }, [areaToolActive, areaMode, circleCenter, circleRadius, polygonPoints, plotted]);
 
   if (!isMounted) {
     return (
-      <div className="h-full w-full bg-slate-900 flex items-center justify-center">
-        <div className="w-10 h-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+      <div className="h-full w-full bg-[#000000] flex items-center justify-center">
+        <div className="w-10 h-10 border-4 border-[#EB6410] border-t-transparent rounded-full animate-spin"></div>
       </div>
     );
   }
 
-  // Verde online, vermelho offline, âmbar quando o sinal está fraco. O modo de
-  // operação (Bridge/PPPoE) não entra na cor — não muda o diagnóstico de campo.
+  // Verde online, vermelho offline, âmbar quando o sinal está fraco.
   const createCustomIcon = (
     online: boolean,
     infoRx: number | undefined,
@@ -256,9 +264,8 @@ export default function MapComponent({
     if (!online) color = "#ef4444";
     else if (infoRx !== undefined && infoRx < -25) color = "#f59e0b";
 
-    // Borda sólida x tracejada distingue posição própria de herdada da CTO.
-    const border = aproximado ? "3px dashed #cbd5e1" : "3px solid white";
-    const ring = destacado ? "box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.85);" : "";
+    const border = aproximado ? "3px dashed #DFDAC6" : "3px solid #FFFFFF";
+    const ring = destacado ? "box-shadow: 0 0 0 4px rgba(235, 100, 16, 0.9);" : "";
 
     return L.divIcon({
       className: "custom-div-icon",
@@ -276,22 +283,28 @@ export default function MapComponent({
   };
 
   return (
-    <div className="h-full w-full relative z-0">
+    <div
+      className={
+        isFullscreen
+          ? "fixed inset-0 z-[2000] h-screen w-screen bg-[#000000]"
+          : "h-full w-full relative z-0"
+      }
+    >
       {/* Barra Superior Esquerda: Botão e Controles de Análise de Área */}
-      <div className="absolute top-3 left-3 right-3 sm:right-auto z-[1000] flex flex-col gap-2 max-w-md pointer-events-none">
+      <div className="absolute top-3 left-3 right-16 sm:right-auto z-[1000] flex flex-col gap-2 max-w-md pointer-events-none">
         {!areaToolActive ? (
           <button
             onClick={() => setAreaToolActive(true)}
-            className="pointer-events-auto self-start flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold px-3.5 py-2.5 rounded-xl shadow-lg border border-indigo-400/40 transition-all cursor-pointer"
+            className="pointer-events-auto self-start flex items-center gap-2 bg-gradient-to-r from-[#EB6410] to-[#E84818] hover:brightness-110 text-[#FFFFFF] text-xs font-bold px-3.5 py-2.5 rounded-xl shadow-lg border border-[#EB6410]/50 transition-all cursor-pointer"
           >
             <Radar className="w-4 h-4" />
             Analisar Área / Raio
           </button>
         ) : (
-          <div className="pointer-events-auto bg-slate-950/90 backdrop-blur-md border border-indigo-500/40 rounded-2xl p-3 shadow-2xl space-y-2.5 text-slate-200">
+          <div className="pointer-events-auto bg-[#000000]/95 backdrop-blur-md border border-[#EB6410]/60 rounded-2xl p-3 shadow-2xl space-y-2.5 text-[#FFFFFF]">
             <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-1.5 text-xs font-extrabold text-indigo-300 uppercase tracking-wider">
-                <Radar className="w-4 h-4 text-indigo-400" />
+              <div className="flex items-center gap-1.5 text-xs font-extrabold text-[#EB6410] uppercase tracking-wider">
+                <Radar className="w-4 h-4 text-[#EB6410]" />
                 Análise de Área
               </div>
 
@@ -303,8 +316,8 @@ export default function MapComponent({
                   }}
                   className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
                     areaMode === "raio"
-                      ? "bg-indigo-600 text-white"
-                      : "bg-slate-900 text-slate-400 hover:text-slate-200"
+                      ? "bg-[#EB6410] text-[#FFFFFF]"
+                      : "bg-[#333333]/60 text-[#D2D2D2] hover:text-[#FFFFFF]"
                   }`}
                 >
                   <CircleDot className="w-3.5 h-3.5" /> Raio
@@ -316,15 +329,15 @@ export default function MapComponent({
                   }}
                   className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
                     areaMode === "poligono"
-                      ? "bg-indigo-600 text-white"
-                      : "bg-slate-900 text-slate-400 hover:text-slate-200"
+                      ? "bg-[#EB6410] text-[#FFFFFF]"
+                      : "bg-[#333333]/60 text-[#D2D2D2] hover:text-[#FFFFFF]"
                   }`}
                 >
                   <Pentagon className="w-3.5 h-3.5" /> Polígono
                 </button>
                 <button
                   onClick={handleCloseTool}
-                  className="ml-1 p-1 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
+                  className="ml-1 p-1 text-[#D2D2D2] hover:text-[#FFFFFF] rounded-lg hover:bg-[#333333] transition-colors cursor-pointer"
                   title="Fechar análise de área"
                 >
                   <X className="w-4 h-4" />
@@ -334,7 +347,7 @@ export default function MapComponent({
 
             {areaMode === "raio" ? (
               <div className="space-y-2">
-                <p className="text-[11px] text-slate-300 leading-snug">
+                <p className="text-[11px] text-[#D2D2D2] leading-snug">
                   {circleCenter
                     ? "Toque em outro ponto no mapa para mover o centro ou ajuste o raio:"
                     : "👆 Toque em qualquer ponto do mapa para traçar o raio de busca."}
@@ -348,8 +361,8 @@ export default function MapComponent({
                       onClick={() => setCircleRadius(preset)}
                       className={`px-2 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
                         circleRadius === preset
-                          ? "bg-indigo-500/30 text-indigo-200 border border-indigo-400/50"
-                          : "bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800"
+                          ? "bg-[#EB6410]/25 text-[#DFDAC6] border border-[#EB6410]"
+                          : "bg-[#333333]/40 text-[#D2D2D2] hover:text-[#FFFFFF] border border-[#333333]"
                       }`}
                     >
                       {preset >= 1000 ? `${preset / 1000} km` : `${preset} m`}
@@ -358,7 +371,7 @@ export default function MapComponent({
                   {circleCenter && (
                     <button
                       onClick={() => setCircleCenter(null)}
-                      className="ml-auto px-2 py-1 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-rose-400 border border-slate-800 flex items-center gap-1 cursor-pointer"
+                      className="ml-auto px-2 py-1 rounded-lg text-[11px] font-semibold bg-[#333333]/40 hover:bg-[#333333] text-rose-400 border border-[#333333] flex items-center gap-1 cursor-pointer"
                     >
                       <Trash2 className="w-3 h-3" /> Limpar
                     </button>
@@ -374,9 +387,9 @@ export default function MapComponent({
                     step={50}
                     value={circleRadius}
                     onChange={(e) => setCircleRadius(Number(e.target.value))}
-                    className="w-full accent-indigo-500 cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                    className="w-full accent-[#EB6410] cursor-pointer h-1.5 bg-[#333333] rounded-lg"
                   />
-                  <span className="text-[11px] font-mono font-bold text-indigo-300 shrink-0 min-w-[54px] text-right">
+                  <span className="text-[11px] font-mono font-bold text-[#EB6410] shrink-0 min-w-[54px] text-right">
                     {circleRadius >= 1000
                       ? `${(circleRadius / 1000).toFixed(2).replace(/\.?0+$/, "")} km`
                       : `${circleRadius} m`}
@@ -385,7 +398,7 @@ export default function MapComponent({
               </div>
             ) : (
               <div className="space-y-2">
-                <p className="text-[11px] text-slate-300 leading-snug">
+                <p className="text-[11px] text-[#D2D2D2] leading-snug">
                   {polygonPoints.length < 3
                     ? `👆 Toque no mapa para marcar os cantos da área (${polygonPoints.length}/3 pontos mínimos).`
                     : `Área fechada com ${polygonPoints.length} pontos. Continue tocando para expandir.`}
@@ -394,13 +407,13 @@ export default function MapComponent({
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => setPolygonPoints((prev) => prev.slice(0, -1))}
-                      className="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 flex items-center gap-1 cursor-pointer"
+                      className="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-[#333333]/50 hover:bg-[#333333] text-[#D2D2D2] border border-[#333333] flex items-center gap-1 cursor-pointer"
                     >
                       <RotateCcw className="w-3 h-3" /> Desfazer ponto
                     </button>
                     <button
                       onClick={() => setPolygonPoints([])}
-                      className="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-slate-900 hover:bg-slate-800 text-rose-400 border border-slate-800 flex items-center gap-1 cursor-pointer"
+                      className="px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-[#333333]/50 hover:bg-[#333333] text-rose-400 border border-[#333333] flex items-center gap-1 cursor-pointer"
                     >
                       <Trash2 className="w-3 h-3" /> Limpar
                     </button>
@@ -411,13 +424,13 @@ export default function MapComponent({
 
             {/* Aviso caso não esteja com Toda a Rede selecionada */}
             {escopo && escopo !== "tudo" && onChangeEscopo && (
-              <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-800/80 text-[11px]">
-                <span className="text-amber-300/90">
+              <div className="flex items-center justify-between gap-2 pt-2 border-t border-[#333333] text-[11px]">
+                <span className="text-[#DFDAC6]">
                   Filtro atual: <strong>{escopo === "pon" ? "1 PON" : "1 Slot"}</strong>
                 </span>
                 <button
                   onClick={() => onChangeEscopo("tudo")}
-                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 font-bold cursor-pointer transition-colors"
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#EB6410]/20 hover:bg-[#EB6410]/30 text-[#EB6410] border border-[#EB6410]/40 font-bold cursor-pointer transition-colors"
                 >
                   <Globe className="w-3 h-3" /> Ver todas as PONs da rede
                 </button>
@@ -427,37 +440,64 @@ export default function MapComponent({
         )}
       </div>
 
+      {/* Canto Superior Direito: Botão de Tela Cheia + Aviso sem coordenada */}
+      <div className="absolute top-3 right-3 z-[1000] flex items-center gap-2">
+        {semCoordenada > 0 && (
+          <div className="hidden sm:block bg-[#000000]/90 backdrop-blur-md border border-[#EB6410]/40 text-[#DFDAC6] text-xs font-semibold px-3 py-2 rounded-xl shadow-lg">
+            {semCoordenada} ONU{semCoordenada > 1 ? "s" : ""} sem coordenada no SGP
+          </div>
+        )}
+
+        <button
+          onClick={() => setIsFullscreen((v) => !v)}
+          className="flex items-center gap-1.5 bg-[#000000]/90 hover:bg-[#333333] text-[#FFFFFF] border border-[#333333] hover:border-[#EB6410] text-xs font-bold px-3 py-2.5 rounded-xl shadow-lg transition-all cursor-pointer"
+          title={isFullscreen ? "Sair da Tela Cheia (Esc)" : "Expandir Mapa em Tela Cheia"}
+        >
+          {isFullscreen ? (
+            <>
+              <Minimize2 className="w-4 h-4 text-[#EB6410]" />
+              <span className="hidden sm:inline">Sair da Tela Cheia</span>
+            </>
+          ) : (
+            <>
+              <Maximize2 className="w-4 h-4 text-[#EB6410]" />
+              <span className="hidden sm:inline">Tela Cheia</span>
+            </>
+          )}
+        </button>
+      </div>
+
       {/* Card de Resultado da Área Selecionada */}
       {areaSelection && (
-        <div className="absolute bottom-3 left-3 right-3 sm:left-auto sm:right-3 sm:top-14 sm:bottom-auto z-[1000] sm:w-80 bg-slate-950/92 backdrop-blur-md border border-indigo-500/40 rounded-2xl p-3.5 shadow-2xl text-slate-200 max-h-[55vh] flex flex-col gap-3 overflow-y-auto custom-scrollbar">
+        <div className="absolute bottom-3 left-3 right-3 sm:left-auto sm:right-3 sm:top-16 sm:bottom-auto z-[1000] sm:w-80 bg-[#000000]/95 backdrop-blur-md border border-[#EB6410]/50 rounded-2xl p-3.5 shadow-2xl text-[#FFFFFF] max-h-[55vh] flex flex-col gap-3 overflow-y-auto custom-scrollbar">
           {/* Resumo de Clientes e PONs */}
           <div className="grid grid-cols-2 gap-2">
-            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5">
-              <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            <div className="bg-[#333333]/35 border border-[#333333] rounded-xl p-2.5">
+              <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-[#D2D2D2]">
                 <span>Clientes na Área</span>
-                <Users className="w-3.5 h-3.5 text-indigo-400" />
+                <Users className="w-3.5 h-3.5 text-[#EB6410]" />
               </div>
-              <div className="text-xl font-extrabold text-white mt-0.5">
+              <div className="text-xl font-extrabold text-[#FFFFFF] mt-0.5">
                 {areaSelection.onusInside.length}
               </div>
               <div className="text-[11px] font-semibold mt-0.5 flex items-center gap-2">
                 <span className="text-emerald-400">{areaSelection.onlineTotal} on</span>
-                <span className="text-slate-600">&bull;</span>
+                <span className="text-[#333333]">&bull;</span>
                 <span className="text-rose-400">{areaSelection.offlineTotal} off</span>
               </div>
             </div>
 
-            <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5">
-              <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
+            <div className="bg-[#333333]/35 border border-[#333333] rounded-xl p-2.5">
+              <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-[#D2D2D2]">
                 <span>PONs na Área</span>
-                <Layers className="w-3.5 h-3.5 text-indigo-400" />
+                <Layers className="w-3.5 h-3.5 text-[#EB6410]" />
               </div>
-              <div className="text-xl font-extrabold text-indigo-300 mt-0.5">
+              <div className="text-xl font-extrabold text-[#EB6410] mt-0.5">
                 {areaSelection.pons.length}
               </div>
-              <div className="text-[11px] text-slate-400 font-medium mt-0.5">
+              <div className="text-[11px] text-[#DFDAC6] font-medium mt-0.5">
                 {areaSelection.ctosSummary.length} CTO
-                {areaSelection.ctosSummary.length === 1 ? "" : "s"} envolvida
+                {areaSelection.ctosSummary.length === 1 ? "" : "s"} vinculada
                 {areaSelection.ctosSummary.length === 1 ? "" : "s"}
               </div>
             </div>
@@ -465,13 +505,13 @@ export default function MapComponent({
 
           {/* Lista detalhada de PONs que atendem a área */}
           <div className="space-y-1.5">
-            <div className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 flex items-center justify-between">
+            <div className="text-[10px] font-extrabold uppercase tracking-wider text-[#D2D2D2] flex items-center justify-between">
               <span>Distribuição por Porta PON</span>
               <span>Clientes</span>
             </div>
 
             {areaSelection.pons.length === 0 ? (
-              <p className="text-xs text-slate-500 italic py-2 text-center">
+              <p className="text-xs text-[#D2D2D2]/60 italic py-2 text-center">
                 Nenhum cliente posicionado dentro deste perímetro.
               </p>
             ) : (
@@ -481,20 +521,20 @@ export default function MapComponent({
                     key={`pon-${p.slot}-${p.pon}`}
                     onClick={() => onSelectPon?.(p.slot, p.pon)}
                     title={onSelectPon ? "Clique para filtrar apenas esta PON" : undefined}
-                    className={`flex items-center justify-between bg-slate-900/70 border border-slate-800/90 rounded-xl px-2.5 py-1.5 text-xs ${
-                      onSelectPon ? "hover:border-indigo-500/50 cursor-pointer transition-colors" : ""
+                    className={`flex items-center justify-between bg-[#333333]/30 border border-[#333333] rounded-xl px-2.5 py-1.5 text-xs ${
+                      onSelectPon ? "hover:border-[#EB6410] cursor-pointer transition-colors" : ""
                     }`}
                   >
-                    <div className="font-bold text-slate-200">
-                      Slot <span className="text-indigo-300">{p.slot}</span> &bull; PON{" "}
-                      <span className="text-indigo-300">{p.pon}</span>
+                    <div className="font-bold text-[#FFFFFF]">
+                      Slot <span className="text-[#EB6410]">{p.slot}</span> &bull; PON{" "}
+                      <span className="text-[#EB6410]">{p.pon}</span>
                     </div>
                     <div className="flex items-center gap-2 text-[11px] font-semibold">
                       <span className="text-emerald-400">{p.online} on</span>
                       {p.offline > 0 && (
                         <span className="text-rose-400">{p.offline} off</span>
                       )}
-                      <span className="px-1.5 py-0.5 rounded-md bg-indigo-500/20 text-indigo-200 font-extrabold">
+                      <span className="px-1.5 py-0.5 rounded-md bg-[#EB6410]/20 text-[#DFDAC6] border border-[#EB6410]/40 font-extrabold">
                         {p.total}
                       </span>
                     </div>
@@ -504,20 +544,20 @@ export default function MapComponent({
             )}
           </div>
 
-          {/* CTOs que atendem a área */}
+          {/* CTOs vinculadas aos clientes da área */}
           {areaSelection.ctosSummary.length > 0 && (
             <div className="space-y-1">
-              <div className="text-[10px] font-extrabold uppercase tracking-wider text-slate-400 flex items-center gap-1">
-                <Box className="w-3 h-3 text-indigo-400" />
+              <div className="text-[10px] font-extrabold uppercase tracking-wider text-[#D2D2D2] flex items-center gap-1">
+                <Box className="w-3 h-3 text-[#EB6410]" />
                 CTOs na Região ({areaSelection.ctosSummary.length})
               </div>
               <div className="flex flex-wrap gap-1 max-h-20 overflow-y-auto custom-scrollbar">
                 {areaSelection.ctosSummary.map((c) => (
                   <span
                     key={c.ident}
-                    className="text-[10px] font-semibold bg-slate-900 border border-slate-800 text-slate-300 px-2 py-0.5 rounded-lg"
+                    className="text-[10px] font-semibold bg-[#333333]/40 border border-[#333333] text-[#DFDAC6] px-2 py-0.5 rounded-lg"
                   >
-                    {c.ident} <strong className="text-indigo-300">({c.count})</strong>
+                    {c.ident} <strong className="text-[#EB6410]">({c.count})</strong>
                   </span>
                 ))}
               </div>
@@ -526,10 +566,10 @@ export default function MapComponent({
 
           {/* Lista expansível dos clientes dentro da área */}
           {areaSelection.onusInside.length > 0 && (
-            <div className="pt-1 border-t border-slate-800/80">
+            <div className="pt-1 border-t border-[#333333]">
               <button
                 onClick={() => setShowClientList((v) => !v)}
-                className="w-full flex items-center justify-between text-[11px] font-bold text-indigo-300 hover:text-indigo-200 py-1 cursor-pointer"
+                className="w-full flex items-center justify-between text-[11px] font-bold text-[#EB6410] hover:text-[#DFDAC6] py-1 cursor-pointer"
               >
                 <span>
                   {showClientList ? "Ocultar clientes da área" : "Ver clientes da área"} (
@@ -549,7 +589,7 @@ export default function MapComponent({
                     return (
                       <div
                         key={`area-onu-${o.id}`}
-                        className="flex items-center justify-between gap-2 text-[11px] bg-slate-900/60 border border-slate-800/70 rounded-lg px-2 py-1"
+                        className="flex items-center justify-between gap-2 text-[11px] bg-[#333333]/30 border border-[#333333] rounded-lg px-2 py-1"
                       >
                         <div className="flex items-center gap-1.5 min-w-0">
                           <span
@@ -557,11 +597,11 @@ export default function MapComponent({
                               on ? "bg-emerald-500" : "bg-rose-500"
                             }`}
                           />
-                          <span className="truncate text-slate-200 font-medium">
+                          <span className="truncate text-[#FFFFFF] font-medium">
                             {o.service_cliente || `Contrato #${o.service_contrato}`}
                           </span>
                         </div>
-                        <span className="text-[10px] font-mono text-slate-400 shrink-0">
+                        <span className="text-[10px] font-mono text-[#DFDAC6] shrink-0">
                           S{o.slot}/P{o.pon}
                         </span>
                       </div>
@@ -571,12 +611,6 @@ export default function MapComponent({
               )}
             </div>
           )}
-        </div>
-      )}
-
-      {semCoordenada > 0 && (
-        <div className="absolute top-3 right-3 z-[1000] hidden sm:block bg-slate-950/85 backdrop-blur-md border border-amber-500/30 text-amber-300 text-xs font-semibold px-3 py-2 rounded-xl shadow-lg">
-          {semCoordenada} ONU{semCoordenada > 1 ? "s" : ""} sem coordenada no SGP
         </div>
       )}
 
@@ -590,8 +624,6 @@ export default function MapComponent({
           cursor: areaToolActive ? "crosshair" : "grab",
         }}
         zoomControl={false}
-        // CTOs viram desenho em canvas: um elemento no DOM em vez de um por
-        // círculo, o que sustenta a rede inteira sem travar.
         preferCanvas
       >
         <TileLayer
@@ -599,6 +631,7 @@ export default function MapComponent({
           url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
+        <InvalidateMapSize trigger={isFullscreen} />
         <FitBounds points={bounds} disabled={areaToolActive} />
 
         <AreaClickHandler
@@ -615,9 +648,9 @@ export default function MapComponent({
               center={circleCenter}
               radius={circleRadius}
               pathOptions={{
-                color: "#6366f1",
+                color: "#EB6410",
                 weight: 2.5,
-                fillColor: "#6366f1",
+                fillColor: "#E84818",
                 fillOpacity: 0.18,
               }}
             />
@@ -625,9 +658,9 @@ export default function MapComponent({
               center={circleCenter}
               radius={5}
               pathOptions={{
-                color: "#ffffff",
+                color: "#FFFFFF",
                 weight: 2,
-                fillColor: "#6366f1",
+                fillColor: "#E84818",
                 fillOpacity: 1,
               }}
             />
@@ -641,9 +674,9 @@ export default function MapComponent({
               <Polygon
                 positions={polygonPoints}
                 pathOptions={{
-                  color: "#6366f1",
+                  color: "#EB6410",
                   weight: 2.5,
-                  fillColor: "#6366f1",
+                  fillColor: "#E84818",
                   fillOpacity: 0.18,
                 }}
               />
@@ -651,7 +684,7 @@ export default function MapComponent({
               <Polyline
                 positions={polygonPoints}
                 pathOptions={{
-                  color: "#6366f1",
+                  color: "#EB6410",
                   weight: 2.5,
                   dashArray: "6 6",
                 }}
@@ -663,45 +696,15 @@ export default function MapComponent({
                 center={pt}
                 radius={5}
                 pathOptions={{
-                  color: "#ffffff",
+                  color: "#FFFFFF",
                   weight: 2,
-                  fillColor: "#6366f1",
+                  fillColor: "#E84818",
                   fillOpacity: 1,
                 }}
               />
             ))}
           </>
         )}
-
-        {ctos.map((cto) => {
-          const filhas = plotted.filter((o) => o.cto === cto.ident);
-          const ativas = filhas.filter(isOnline).length;
-          return (
-            <CircleMarker
-              key={`cto-${cto.ident}`}
-              center={[cto.lat, cto.lng]}
-              radius={8}
-              pathOptions={{
-                color: ativas > 0 ? "#818cf8" : "#64748b",
-                weight: 2.5,
-                fillColor: "#1e1b4b",
-                fillOpacity: 0.85,
-              }}
-            >
-              <Popup>
-                <div className="p-1 min-w-[190px]">
-                  <h3 className="font-bold text-slate-800 text-sm mb-1">{cto.ident}</h3>
-                  <p className="text-xs text-slate-600 mb-1.5">
-                    {cto.nota || "Sem referência cadastrada"}
-                  </p>
-                  <p className="text-xs font-semibold text-slate-700">
-                    {ativas} de {filhas.length} ONU{filhas.length === 1 ? "" : "s"} online
-                  </p>
-                </div>
-              </Popup>
-            </CircleMarker>
-          );
-        })}
 
         {plotted.map((onu) => {
           const online = isOnline(onu);
@@ -716,9 +719,9 @@ export default function MapComponent({
             >
               <Popup className="custom-popup">
                 <div className="p-1 min-w-[220px]">
-                  <div className="flex items-center gap-2 mb-1 pb-2 border-b border-slate-100">
+                  <div className="flex items-center gap-2 mb-1 pb-2 border-b border-slate-200">
                     <div className={`w-2.5 h-2.5 rounded-full ${!online ? "bg-red-500" : "bg-emerald-500"}`} />
-                    <h3 className="font-bold text-slate-800 text-base leading-none">
+                    <h3 className="font-bold text-slate-900 text-base leading-none">
                       {onu.service_cliente || "Sem Nome Definido"}
                     </h3>
                   </div>
@@ -735,7 +738,7 @@ export default function MapComponent({
                   )}
 
                   {aproximado && (
-                    <div className="mt-2 text-[11px] font-semibold text-amber-600 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                    <div className="mt-2 text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
                       Posição aproximada (da CTO)
                     </div>
                   )}
@@ -743,18 +746,18 @@ export default function MapComponent({
                   <div className="space-y-2 mt-2 text-sm">
                     <div className="flex justify-between items-center">
                       <span className="text-slate-500 font-medium">OLT/PON:</span>
-                      <span className="font-semibold text-slate-700">{onu.olt_id} / {onu.pon}</span>
+                      <span className="font-semibold text-slate-800">{onu.olt_id} / {onu.pon}</span>
                     </div>
 
                     <div className="flex justify-between items-center">
                       <span className="text-slate-500 font-medium">Slot:</span>
-                      <span className="font-semibold text-slate-700">{onu.slot}</span>
+                      <span className="font-semibold text-slate-800">{onu.slot}</span>
                     </div>
 
                     {onu.cto && (
                       <div className="flex justify-between items-center">
                         <span className="text-slate-500 font-medium">CTO:</span>
-                        <span className="font-semibold text-slate-700 text-xs text-right">
+                        <span className="font-semibold text-slate-800 text-xs text-right">
                           {onu.cto}{onu.ctoport ? ` / P${onu.ctoport}` : ""}
                         </span>
                       </div>
@@ -762,14 +765,14 @@ export default function MapComponent({
 
                     <div className="flex justify-between items-center">
                       <span className="text-slate-500 font-medium">MAC:</span>
-                      <span className="font-mono text-xs text-slate-600 bg-slate-100 px-1 py-0.5 rounded">
+                      <span className="font-mono text-xs text-slate-700 bg-slate-100 px-1 py-0.5 rounded">
                         {onu.phy_addr}
                       </span>
                     </div>
 
                     <div className="flex justify-between items-center">
                       <span className="text-slate-500 font-medium">Sinal (RX):</span>
-                      <span className={`font-semibold ${onu.info_rx && onu.info_rx < -25 ? "text-amber-500" : "text-slate-700"}`}>
+                      <span className={`font-semibold ${onu.info_rx && onu.info_rx < -25 ? "text-amber-600" : "text-slate-800"}`}>
                         {onu.info_rx ? `${onu.info_rx} dBm` : "N/A"}
                       </span>
                     </div>
@@ -785,7 +788,7 @@ export default function MapComponent({
                       href={`https://www.google.com/maps/dir/?api=1&destination=${onu.lat},${onu.lng}`}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="block text-center mt-2 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg transition-colors"
+                      className="block text-center mt-2 px-3 py-1.5 bg-gradient-to-r from-[#EB6410] to-[#E84818] hover:brightness-110 text-[#FFFFFF] text-xs font-bold rounded-lg transition-all"
                     >
                       Traçar rota
                     </a>
