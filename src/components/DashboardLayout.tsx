@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import dynamic from "next/dynamic";
-import { CtoPonto, OnuData, OnusResponse, WarmupState } from "@/types";
+import { CtoPonto, OnuData, OnusResponse, WarmupState, CoordSource, GeoIssue, OnuAddress } from "@/types";
 import {
   Activity,
   Router,
@@ -203,6 +203,75 @@ function OnuCard({ onu }: { onu: OnuData }) {
 const AVAILABLE_SLOTS = [8, 11, 12, 13, 14, 15, 16, 17, 18, 19];
 const AVAILABLE_PONS = Array.from({ length: 16 }, (_, i) => i); // 0 a 15
 
+const LOCAL_GEO_CACHE_KEY = "sys3_geo_cache_v1";
+
+interface CachedContractGeo {
+  address?: OnuAddress | null;
+  cto?: string | null;
+  ctoport?: number | null;
+  cto_latlng?: string | null;
+  cto_note?: string | null;
+  enderecoLinha?: string;
+  lat: number | null;
+  lng: number | null;
+  coordSource: CoordSource;
+  geoIssue?: GeoIssue;
+}
+
+function loadLocalGeoCache(): Record<number, CachedContractGeo> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(LOCAL_GEO_CACHE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveLocalGeoCache(cacheObj: Record<number, CachedContractGeo>) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(LOCAL_GEO_CACHE_KEY, JSON.stringify(cacheObj));
+  } catch {
+    // Ignora caso exceda a cota do navegador
+  }
+}
+
+function applyGeoToOnu(
+  onu: OnuData,
+  geo: CachedContractGeo,
+  ctoLookup: Map<string, CtoPonto>
+): OnuData {
+  let lat = geo.lat;
+  let lng = geo.lng;
+  let coordSource = geo.coordSource;
+  let geoIssue = geo.geoIssue ?? null;
+  const cto = geo.cto ?? onu.cto ?? null;
+  const ctoInfo = cto ? ctoLookup.get(cto) : undefined;
+
+  if ((lat === null || lng === null) && ctoInfo) {
+    lat = ctoInfo.lat;
+    lng = ctoInfo.lng;
+    coordSource = "cto";
+    geoIssue = "aproximado_cto";
+  }
+
+  return {
+    ...onu,
+    address: geo.address ?? onu.address,
+    cto,
+    ctoport: geo.ctoport ?? onu.ctoport,
+    cto_latlng: geo.cto_latlng ?? (ctoInfo ? `${ctoInfo.lat},${ctoInfo.lng}` : onu.cto_latlng),
+    cto_note: geo.cto_note ?? ctoInfo?.nota ?? onu.cto_note,
+    enderecoLinha: geo.enderecoLinha ?? onu.enderecoLinha,
+    lat,
+    lng,
+    coordSource,
+    geoIssue,
+    aguardandoGeo: false,
+  };
+}
+
 export default function DashboardLayout() {
   const [onus, setOnus] = useState<OnuData[]>([]);
   const [ctos, setCtos] = useState<CtoPonto[]>([]);
@@ -216,8 +285,93 @@ export default function DashboardLayout() {
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ONLINE' | 'OFFLINE'>('ALL');
   const [viewMode, setViewMode] = useState<'MAPA' | 'LISTA' | 'PENDENCIAS'>('MAPA');
+  const batchAbortRef = useRef<number>(0);
+
+  /** Resolve contratos pendentes em lotes rápidos (compatível com Vercel) e atualiza o mapa ao vivo. */
+  const resolverPendentesEmLotes = async (
+    listaAtual: OnuData[],
+    ctosAtuais: CtoPonto[],
+    runId: number
+  ) => {
+    const pendentes = [
+      ...new Set(
+        listaAtual
+          .filter((o) => o.aguardandoGeo && o.service_contrato)
+          .map((o) => o.service_contrato as number)
+      ),
+    ];
+
+    if (pendentes.length === 0) {
+      setAquecendo(null);
+      return;
+    }
+
+    const ctoLookup = new Map(ctosAtuais.map((c) => [c.ident, c]));
+    const localCache = loadLocalGeoCache();
+    const TAMANHO_LOTE = 80;
+    let feitos = 0;
+
+    setAquecendo({
+      rodando: true,
+      feitos: 0,
+      total: pendentes.length,
+      iniciadoEm: Date.now(),
+    });
+
+    for (let i = 0; i < pendentes.length; i += TAMANHO_LOTE) {
+      if (batchAbortRef.current !== runId) return;
+
+      const lote = pendentes.slice(i, i + TAMANHO_LOTE);
+      try {
+        const res = await fetch("/api/onus/warmup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contratos: lote }),
+        });
+
+        if (batchAbortRef.current !== runId) return;
+
+        if (res.ok) {
+          const data = await res.json();
+          const resolved: Record<string, CachedContractGeo> = data.resolved ?? {};
+
+          for (const [cidStr, geo] of Object.entries(resolved)) {
+            localCache[Number(cidStr)] = geo;
+          }
+          saveLocalGeoCache(localCache);
+
+          setOnus((prev) =>
+            prev.map((o) => {
+              if (!o.service_contrato) return o;
+              const geo = resolved[String(o.service_contrato)];
+              if (!geo) return o;
+              return applyGeoToOnu(o, geo, ctoLookup);
+            })
+          );
+        }
+      } catch (err) {
+        console.warn("Falha ao buscar lote de endereços:", err);
+      }
+
+      feitos = Math.min(pendentes.length, i + lote.length);
+      if (batchAbortRef.current === runId) {
+        setAquecendo({
+          rodando: feitos < pendentes.length,
+          feitos,
+          total: pendentes.length,
+          iniciadoEm: Date.now(),
+        });
+      }
+    }
+
+    if (batchAbortRef.current === runId) {
+      setAquecendo(null);
+      setMeta((prev) => (prev ? { ...prev, pendentes: 0 } : prev));
+    }
+  };
 
   const fetchOnus = async () => {
+    const runId = ++batchAbortRef.current;
     try {
       setIsLoading(true);
       setErrorMsg(null);
@@ -232,10 +386,66 @@ export default function DashboardLayout() {
       }
 
       const payload = data as OnusResponse;
-      const validOnus = (payload.onus ?? []).filter(onu => !!onu.service_contrato);
+      const ctosList = payload.ctos ?? [];
+      const ctoLookup = new Map(ctosList.map((c) => [c.ident, c]));
+      const localCache = loadLocalGeoCache();
+      let cacheMudou = false;
+
+      const validOnus = (payload.onus ?? [])
+        .filter((onu) => !!onu.service_contrato)
+        .map((onu) => {
+          const cid = onu.service_contrato!;
+          // Se o servidor já trouxe resolvido, salva no cache local do navegador
+          if (!onu.aguardandoGeo) {
+            localCache[cid] = {
+              address: onu.address,
+              cto: onu.cto,
+              ctoport: onu.ctoport,
+              cto_latlng: onu.cto_latlng,
+              cto_note: onu.cto_note,
+              enderecoLinha: onu.enderecoLinha,
+              lat: onu.lat,
+              lng: onu.lng,
+              coordSource: onu.coordSource,
+              geoIssue: onu.geoIssue,
+            };
+            cacheMudou = true;
+            return onu;
+          }
+
+          // Se veio pendente do servidor (ex: visão "Toda a rede"), restaura imediatamente do cache local
+          const cached = localCache[cid];
+          if (cached) {
+            return applyGeoToOnu(onu, cached, ctoLookup);
+          }
+
+          return onu;
+        });
+
+      if (cacheMudou) {
+        saveLocalGeoCache(localCache);
+      }
+
+      const restamPendentes = validOnus.filter((o) => o.aguardandoGeo).length;
+
       setOnus(validOnus);
-      setCtos(payload.ctos ?? []);
-      setMeta(payload.meta ?? null);
+      setCtos(ctosList);
+      setMeta(
+        payload.meta
+          ? {
+              ...payload.meta,
+              pendentes: restamPendentes,
+              plotadas: validOnus.filter((o) => o.lat !== null).length,
+            }
+          : null
+      );
+
+      // Se ainda houver contratos sem endereço carregado, busca automaticamente em lotes
+      if (restamPendentes > 0) {
+        void resolverPendentesEmLotes(validOnus, ctosList, runId);
+      } else {
+        setAquecendo(null);
+      }
     } catch (error) {
       console.warn("Erro ao buscar dados do NOC:", error);
       setErrorMsg("Ocorreu uma falha inesperada na comunicação com a API local.");
@@ -244,41 +454,16 @@ export default function DashboardLayout() {
     }
   };
 
-  /** Dispara o preenchimento do cache de endereços da rede inteira. */
+  /** Permite disparar manualmente caso algum lote tenha falhado. */
   const iniciarAquecimento = async () => {
-    try {
-      const res = await fetch("/api/onus/warmup", { method: "POST" });
-      const estado: WarmupState = await res.json();
-      setAquecendo(estado);
-    } catch (error) {
-      console.warn("Falha ao iniciar aquecimento:", error);
-    }
+    const runId = ++batchAbortRef.current;
+    await resolverPendentesEmLotes(onus, ctos, runId);
   };
 
   useEffect(() => {
     // Busca inicial e a cada mudança de escopo, slot ou PON (sem auto-refresh automático)
     fetchOnus();
   }, [escopo, selectedSlot, selectedPon]);
-
-  // Acompanha o aquecimento e recarrega os dados quando ele termina.
-  useEffect(() => {
-    if (!aquecendo?.rodando) return;
-
-    const id = setInterval(async () => {
-      try {
-        const estado: WarmupState = await (await fetch("/api/onus/warmup")).json();
-        setAquecendo(estado);
-        if (!estado.rodando) {
-          clearInterval(id);
-          fetchOnus();
-        }
-      } catch {
-        clearInterval(id);
-      }
-    }, 2000);
-
-    return () => clearInterval(id);
-  }, [aquecendo?.rodando]);
 
   // Lógica de Busca de Assinantes
   const filteredOnus = useMemo(() => {

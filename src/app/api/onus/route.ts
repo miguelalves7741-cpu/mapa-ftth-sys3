@@ -15,7 +15,7 @@ import {
 import { allCtos, getEntry, getWarmup } from "@/lib/geoCache";
 
 /** Quantas ONUs enriquecemos em paralelo. O SGP degrada com muita concorrência. */
-const CONCURRENCY = 8;
+const CONCURRENCY = 16;
 
 /**
  * Teto de consultas novas ao SGP por request, por escopo. Cada endereço custa
@@ -178,7 +178,7 @@ export async function GET(request: Request) {
     // preenchido mas inválido, então o parse é quem decide.
     const ctosUsadas = new Set(enriched.map((o) => o.cto).filter(Boolean));
     const ctos = allCtos()
-      .filter((c) => ctosUsadas.has(c.ident))
+      .filter((c) => escopo === "tudo" || ctosUsadas.has(c.ident))
       .map((c) => {
         const ll = parseLatLng(c.ll);
         return ll ? { ident: c.ident, lat: ll[0], lng: ll[1], nota: c.nota } : null;
