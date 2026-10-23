@@ -256,13 +256,8 @@ export default function DashboardLayout() {
   };
 
   useEffect(() => {
-    // Busca inicial e a cada mudança de escopo, slot ou PON
+    // Busca inicial e a cada mudança de escopo, slot ou PON (sem auto-refresh automático)
     fetchOnus();
-
-    // Auto-refresh a cada 60 segundos
-    const intervalId = setInterval(fetchOnus, 60000);
-
-    return () => clearInterval(intervalId); // Limpa o intervalo ao desmontar ou atualizar dependências
   }, [escopo, selectedSlot, selectedPon]);
 
   // Acompanha o aquecimento e recarrega os dados quando ele termina.
@@ -354,7 +349,7 @@ export default function DashboardLayout() {
     [displayedOnus]
   );
 
-  if (isLoading) {
+  if (isLoading && onus.length === 0) {
     return (
       <main className="flex min-h-screen w-full items-center justify-center bg-slate-950 font-sans">
         <div className="flex flex-col items-center gap-4">
@@ -411,7 +406,7 @@ export default function DashboardLayout() {
           className="flex items-center gap-2 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white rounded-xl border border-slate-800 hover:border-slate-700 transition-all font-semibold text-sm shadow-md cursor-pointer group disabled:opacity-50"
         >
           <RefreshCw className={`w-4 h-4 text-indigo-400 group-hover:rotate-180 transition-transform duration-500 ${isLoading ? 'animate-spin' : ''}`} />
-          <span className="hidden sm:inline">Atualizar</span>
+          <span className="hidden sm:inline">{isLoading ? "Carregando..." : "Atualizar"}</span>
         </button>
       </header>
 

@@ -98,18 +98,18 @@ function AreaClickHandler({
   return null;
 }
 
-/** Ajusta o enquadramento sempre que o conjunto de pontos muda. */
-function FitBounds({ points }: { points: [number, number][] }) {
+/** Ajusta o enquadramento sempre que o conjunto de pontos muda (exceto durante análise de área). */
+function FitBounds({ points, disabled }: { points: [number, number][]; disabled?: boolean }) {
   const map = useMap();
 
   useEffect(() => {
-    if (points.length === 0) return;
+    if (disabled || points.length === 0) return;
     if (points.length === 1) {
       map.setView(points[0], 17);
       return;
     }
     map.fitBounds(L.latLngBounds(points), { padding: [56, 56], maxZoom: 18 });
-  }, [map, points]);
+  }, [map, points, disabled]);
 
   return null;
 }
@@ -599,7 +599,7 @@ export default function MapComponent({
           url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
-        <FitBounds points={bounds} />
+        <FitBounds points={bounds} disabled={areaToolActive} />
 
         <AreaClickHandler
           active={areaToolActive}
