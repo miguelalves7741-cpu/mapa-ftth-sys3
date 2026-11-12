@@ -465,48 +465,46 @@ export default function DashboardLayout() {
     fetchOnus();
   }, [escopo, selectedSlot, selectedPon]);
 
-  // Lógica de Busca de Assinantes
-  const filteredOnus = useMemo(() => {
-    return onus.filter((onu) => {
-      // Busca dinâmica (Nome, MAC, Login ou Contrato)
-      const nameStr = (onu.service_cliente || "").toLowerCase();
-      const macStr = (onu.phy_addr || "").toLowerCase();
-      const loginStr = (onu.service_login || "").toLowerCase();
-      const contractStr = (onu.service_contrato || "").toString();
-      const searchLower = searchQuery.toLowerCase().trim();
-      
-      const matchSearch = searchQuery === "" || 
-        nameStr.includes(searchLower) ||
-        macStr.includes(searchLower) ||
-        loginStr.includes(searchLower) ||
-        contractStr.includes(searchLower);
+  // Lógica de Busca de Assinantes (Nome, MAC, Login, Contrato, Rua, Bairro ou CTO)
+  const normalizeSearch = (val: string | undefined | null) =>
+    (val || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .trim();
 
-      return matchSearch;
-    });
+  const matchesOnuSearch = (onu: OnuData, query: string) => {
+    const q = normalizeSearch(query);
+    if (!q) return true;
+    const haystack = [
+      onu.service_cliente,
+      onu.phy_addr,
+      onu.service_login,
+      onu.service_contrato ? String(onu.service_contrato) : "",
+      onu.enderecoLinha,
+      onu.address?.logradouro,
+      onu.address?.bairro,
+      onu.cto,
+    ]
+      .map(normalizeSearch)
+      .join(" ");
+    return q.split(/\s+/).every((token) => haystack.includes(token));
+  };
+
+  const filteredOnus = useMemo(() => {
+    return onus.filter((onu) => matchesOnuSearch(onu, searchQuery));
   }, [searchQuery, onus]);
 
   // Lógica de Renderização do Grid (Cruzamento de Status com Pesquisa de Texto)
   const displayedOnus = useMemo(() => {
-    return onus.filter(onu => {
+    return onus.filter((onu) => {
       // 1. Filtro de Status
       const isOnline = onu.online === true || onu.online === 1 || String(onu.online) === "1";
-      const matchesStatus = 
-        statusFilter === 'ALL' ? true :
-        statusFilter === 'ONLINE' ? isOnline :
-        !isOnline; // OFFLINE
+      const matchesStatus =
+        statusFilter === "ALL" ? true : statusFilter === "ONLINE" ? isOnline : !isOnline; // OFFLINE
 
-      // 2. Filtro de Pesquisa de Texto (Nome, MAC, Login ou Contrato)
-      const nameStr = (onu.service_cliente || "").toLowerCase();
-      const macStr = (onu.phy_addr || "").toLowerCase();
-      const loginStr = (onu.service_login || "").toLowerCase();
-      const contractStr = (onu.service_contrato || "").toString();
-      const searchLower = searchQuery.toLowerCase().trim();
-      
-      const matchesSearch = searchQuery === "" || 
-        nameStr.includes(searchLower) ||
-        macStr.includes(searchLower) ||
-        loginStr.includes(searchLower) ||
-        contractStr.includes(searchLower);
+      // 2. Filtro de Pesquisa de Texto (Nome, MAC, Login, Contrato, Rua ou CTO)
+      const matchesSearch = matchesOnuSearch(onu, searchQuery);
 
       return matchesStatus && matchesSearch;
     });
@@ -630,13 +628,13 @@ export default function DashboardLayout() {
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               {/* Pesquisa Livre */}
               <div className="relative">
-                <label className="block text-[11px] text-[#D2D2D2] font-semibold uppercase tracking-wider mb-1.5">Pesquisar Assinante</label>
+                <label className="block text-[11px] text-[#D2D2D2] font-semibold uppercase tracking-wider mb-1.5">Pesquisar Assinante / Rua</label>
                 <div className="relative">
                   <input 
                     type="text"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Nome, MAC ou Login..."
+                    placeholder="Nome, Rua, CTO, MAC..."
                     className="w-full bg-[#000000] border border-[#333333] focus:border-[#EB6410] text-sm text-[#FFFFFF] rounded-xl pl-9 pr-3 py-2.5 outline-none focus:ring-1 focus:ring-[#EB6410] transition-all placeholder:text-[#D2D2D2]/40"
                   />
                   <Search className="w-4 h-4 text-[#EB6410] absolute left-3 top-1/2 -translate-y-1/2" />
