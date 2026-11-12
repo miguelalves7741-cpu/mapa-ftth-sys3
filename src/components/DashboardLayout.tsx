@@ -285,6 +285,7 @@ export default function DashboardLayout() {
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ONLINE' | 'OFFLINE'>('ALL');
   const [viewMode, setViewMode] = useState<'MAPA' | 'LISTA' | 'PENDENCIAS'>('MAPA');
+  const [visibleCardsCount, setVisibleCardsCount] = useState<number>(60);
   const batchAbortRef = useRef<number>(0);
 
   /** Resolve contratos pendentes em lotes rápidos (compatível com Vercel) e atualiza o mapa ao vivo. */
@@ -308,8 +309,9 @@ export default function DashboardLayout() {
 
     const ctoLookup = new Map(ctosAtuais.map((c) => [c.ident, c]));
     const localCache = loadLocalGeoCache();
-    const TAMANHO_LOTE = 80;
+    const TAMANHO_LOTE = 100;
     let feitos = 0;
+    let loteIdx = 0;
 
     setAquecendo({
       rodando: true,
@@ -320,6 +322,7 @@ export default function DashboardLayout() {
 
     for (let i = 0; i < pendentes.length; i += TAMANHO_LOTE) {
       if (batchAbortRef.current !== runId) return;
+      loteIdx += 1;
 
       const lote = pendentes.slice(i, i + TAMANHO_LOTE);
       try {
@@ -338,7 +341,10 @@ export default function DashboardLayout() {
           for (const [cidStr, geo] of Object.entries(resolved)) {
             localCache[Number(cidStr)] = geo;
           }
-          saveLocalGeoCache(localCache);
+          // Persiste no localStorage a cada 4 lotes para não travar a thread principal
+          if (loteIdx % 4 === 0 || i + TAMANHO_LOTE >= pendentes.length) {
+            saveLocalGeoCache(localCache);
+          }
 
           setOnus((prev) =>
             prev.map((o) => {
@@ -365,6 +371,7 @@ export default function DashboardLayout() {
     }
 
     if (batchAbortRef.current === runId) {
+      saveLocalGeoCache(localCache);
       setAquecendo(null);
       setMeta((prev) => (prev ? { ...prev, pendentes: 0 } : prev));
     }
@@ -871,6 +878,7 @@ export default function DashboardLayout() {
                   onus={displayedOnus}
                   ctos={ctos}
                   escopo={escopo}
+                  aquecendo={aquecendo}
                   onChangeEscopo={setEscopo}
                   onSelectPon={(slot, pon) => {
                     setSelectedSlot(String(slot));
@@ -903,10 +911,22 @@ export default function DashboardLayout() {
           ) : viewMode === 'PENDENCIAS' ? (
             <GeoAudit onus={displayedOnus} />
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
-              {displayedOnus.map((onu) => (
-                <OnuCard key={onu.id} onu={onu} />
-              ))}
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                {displayedOnus.slice(0, visibleCardsCount).map((onu) => (
+                  <OnuCard key={onu.id} onu={onu} />
+                ))}
+              </div>
+              {displayedOnus.length > visibleCardsCount && (
+                <div className="flex justify-center pt-2">
+                  <button
+                    onClick={() => setVisibleCardsCount((prev) => prev + 80)}
+                    className="px-6 py-2.5 bg-[#333333]/50 hover:bg-[#333333] text-[#FFFFFF] border border-[#EB6410]/50 hover:border-[#EB6410] rounded-xl text-xs font-bold transition-all cursor-pointer"
+                  >
+                    Mostrar mais clientes ({displayedOnus.length - visibleCardsCount} restantes)
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>

@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   MapContainer,
   TileLayer,
-  Marker,
   Popup,
   CircleMarker,
   Circle,
@@ -14,7 +13,7 @@ import {
   useMapEvents,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import { CtoPonto, OnuData } from "@/types";
+import { CtoPonto, OnuData, WarmupState } from "@/types";
 import L from "leaflet";
 import {
   Radar,
@@ -37,21 +36,11 @@ import {
   Signal,
   Sparkles,
   Loader2,
+  Download,
+  Copy,
+  Check,
 } from "lucide-react";
-
-// Leaflet icon fix for Next.js
-import iconRetina from "leaflet/dist/images/marker-icon-2x.png";
-import iconMarker from "leaflet/dist/images/marker-icon.png";
-import iconShadow from "leaflet/dist/images/marker-shadow.png";
-
-const initIconFix = () => {
-  delete (L.Icon.Default.prototype as { _getIconUrl?: unknown })._getIconUrl;
-  L.Icon.Default.mergeOptions({
-    iconRetinaUrl: iconRetina.src,
-    iconUrl: iconMarker.src,
-    shadowUrl: iconShadow.src,
-  });
-};
+import { generateDiagnosticPngBlob } from "@/lib/reportPng";
 
 const isOnline = (o: OnuData) => o.online === true || o.online === 1 || o.online === "1";
 
@@ -59,12 +48,41 @@ interface MapComponentProps {
   onus: OnuData[];
   ctos: CtoPonto[];
   escopo?: "pon" | "slot" | "tudo";
+  aquecendo?: WarmupState | null;
   onChangeEscopo?: (novoEscopo: "pon" | "slot" | "tudo") => void;
   onSelectPon?: (slot: number, pon: number) => void;
 }
 
 const RADIUS_PRESETS = [100, 250, 500, 1000, 2000];
 const STREET_BUFFER_PRESETS = [0, 50, 100, 200];
+
+/** Palavras genéricas de tipo de via/preposição que não devem bloquear o match quando o cadastro diverge (ex: Av. vs Rua). */
+const STREET_STOPWORDS = new Set([
+  "rua",
+  "r",
+  "avenida",
+  "av",
+  "travessa",
+  "tv",
+  "trav",
+  "alameda",
+  "al",
+  "estrada",
+  "estr",
+  "rodovia",
+  "rod",
+  "praca",
+  "pca",
+  "pc",
+  "beco",
+  "loteamento",
+  "lot",
+  "de",
+  "da",
+  "do",
+  "das",
+  "dos",
+]);
 
 /** Remove acentos, converte para minúsculas e limpa espaços extras. */
 function normalizeText(raw: string | undefined | null): string {
@@ -156,8 +174,16 @@ function AreaClickHandler({
   return null;
 }
 
-/** Ajusta o enquadramento sempre que o conjunto de pontos muda (exceto durante análise de área). */
-function FitBounds({ points, disabled }: { points: [number, number][]; disabled?: boolean }) {
+/** Ajusta o enquadramento apenas quando o filtro principal (escopo/slot/pon) muda. */
+function FitBounds({
+  points,
+  disabled,
+  scopeKey,
+}: {
+  points: [number, number][];
+  disabled?: boolean;
+  scopeKey: string;
+}) {
   const map = useMap();
 
   useEffect(() => {
@@ -167,7 +193,8 @@ function FitBounds({ points, disabled }: { points: [number, number][]; disabled?
       return;
     }
     map.fitBounds(L.latLngBounds(points), { padding: [56, 56], maxZoom: 18 });
-  }, [map, points, disabled]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [map, scopeKey, disabled]);
 
   return null;
 }
@@ -183,17 +210,17 @@ function MapFocusController({
   useEffect(() => {
     if (!target) return;
     if (target.point) {
-      map.flyTo(target.point, 18, { duration: 0.6 });
+      map.flyTo(target.point, 18, { duration: 0.5 });
       return;
     }
     if (target.bounds && target.bounds.length > 0) {
       if (target.bounds.length === 1) {
-        map.flyTo(target.bounds[0], 17, { duration: 0.6 });
+        map.flyTo(target.bounds[0], 17, { duration: 0.5 });
       } else {
         map.flyToBounds(L.latLngBounds(target.bounds), {
           padding: [70, 70],
           maxZoom: 18,
-          duration: 0.6,
+          duration: 0.5,
         });
       }
     }
@@ -214,15 +241,80 @@ function InvalidateMapSize({ trigger }: { trigger: boolean }) {
   return null;
 }
 
+/**
+ * Camada de pontos desenhada diretamente em `<canvas>` via `CircleMarker`.
+ * Renderiza milhares de ONUs sem criar nós DOM individuais, mantendo o mapa leve.
+ */
+const OnuCanvasLayer = React.memo(function OnuCanvasLayer({
+  plotted,
+  selectedIds,
+  hasActiveSelection,
+  compact,
+  onSelectOnu,
+}: {
+  plotted: (OnuData & { lat: number; lng: number })[];
+  selectedIds: Set<number> | null;
+  hasActiveSelection: boolean;
+  compact: boolean;
+  onSelectOnu: (onu: OnuData & { lat: number; lng: number }) => void;
+}) {
+  return (
+    <>
+      {plotted.map((onu) => {
+        const online = isOnline(onu);
+        const aproximado = onu.coordSource === "cto";
+        const destacado = selectedIds ? selectedIds.has(onu.id) : false;
+
+        let fillColor = "#10b981";
+        if (!online) fillColor = "#ef4444";
+        else if (onu.info_rx !== undefined && onu.info_rx !== null && onu.info_rx !== 0 && onu.info_rx < -25) {
+          fillColor = "#f59e0b";
+        }
+
+        const dimmed = hasActiveSelection && !destacado;
+        const radius = destacado ? 8 : compact ? 5 : 7;
+        const strokeColor = destacado ? "#EB6410" : aproximado ? "#DFDAC6" : "#FFFFFF";
+        const weight = destacado ? 3 : compact ? 1.2 : 2;
+
+        return (
+          <CircleMarker
+            key={onu.id}
+            center={[onu.lat, onu.lng]}
+            radius={radius}
+            pathOptions={{
+              color: strokeColor,
+              weight,
+              dashArray: aproximado && !destacado ? "3 3" : undefined,
+              fillColor,
+              fillOpacity: dimmed ? 0.2 : 0.92,
+              opacity: dimmed ? 0.25 : 1,
+            }}
+            eventHandlers={{
+              click: (e) => {
+                L.DomEvent.stopPropagation(e);
+                onSelectOnu(onu);
+              },
+            }}
+          />
+        );
+      })}
+    </>
+  );
+});
+
 export default function MapComponent({
   onus,
   escopo,
+  aquecendo,
   onChangeEscopo,
   onSelectPon,
 }: MapComponentProps) {
   const [isMounted, setIsMounted] = useState(false);
   const [mapKey, setMapKey] = useState("map-init");
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [activePopupOnu, setActivePopupOnu] = useState<(OnuData & { lat: number; lng: number }) | null>(
+    null
+  );
 
   // Estados da ferramenta de Análise de Área / Raio / Rua
   const [areaToolActive, setAreaToolActive] = useState(false);
@@ -252,8 +344,11 @@ export default function MapComponent({
     seq: number;
   } | null>(null);
 
+  // Estados de exportação do relatório PNG
+  const [isGeneratingPng, setIsGeneratingPng] = useState(false);
+  const [copiedPng, setCopiedPng] = useState(false);
+
   useEffect(() => {
-    initIconFix();
     setIsMounted(true);
     setMapKey(Date.now().toString());
   }, []);
@@ -270,24 +365,32 @@ export default function MapComponent({
 
   // Só entra no mapa quem realmente tem posição vinda do SGP.
   const plotted = useMemo(
-    () => onus.filter((o): o is OnuData & { lat: number; lng: number } =>
-      o.lat !== null && o.lng !== null
-    ),
+    () =>
+      onus.filter((o): o is OnuData & { lat: number; lng: number } =>
+        o.lat !== null && o.lng !== null
+      ),
     [onus]
   );
 
-  const semCoordenada = onus.filter((o) => o.lat === null && !o.aguardandoGeo).length;
+  const semCoordenada = useMemo(
+    () => onus.filter((o) => o.lat === null && !o.aguardandoGeo).length,
+    [onus]
+  );
 
-  // Enquadramento baseado apenas nos clientes (sem CTOs no mapa)
+  // Enquadramento baseado apenas nos clientes
   const bounds = useMemo<[number, number][]>(
     () => plotted.map((o) => [o.lat, o.lng] as [number, number]),
     [plotted]
   );
 
+  const scopeKey = `${escopo}-${plotted.length > 0 ? "loaded" : "empty"}`;
+
   // Catálogo de todas as ruas presentes nas ONUs carregadas (incluindo sem coordenada GPS)
   const streetCatalog = useMemo<StreetCatalogItem[]>(() => {
-    // 1º passo: identifica bairros por logradouro normalizado para não fragmentar a mesma rua sem bairro
-    const mainBairroByStreet = new Map<string, { normBairro: string; rawBairro: string; count: number }>();
+    const mainBairroByStreet = new Map<
+      string,
+      { normBairro: string; rawBairro: string; count: number }
+    >();
     const countsByStreetBairro = new Map<string, number>();
 
     for (const o of onus) {
@@ -308,7 +411,6 @@ export default function MapComponent({
       }
     }
 
-    // 2º passo: agrupa ONUs por rua + bairro
     const groups = new Map<
       string,
       {
@@ -350,7 +452,6 @@ export default function MapComponent({
         });
       } else {
         existing.onus.push(o);
-        // Prefere o nome de rua mais descritivo (ex: "Rua das Flores" em vez de "R. das Flores")
         if (rawLog.length > existing.logradouro.length) {
           existing.logradouro = rawLog;
         }
@@ -383,7 +484,9 @@ export default function MapComponent({
         logradouro: g.logradouro,
         bairro: g.bairro,
         cidade: g.cidade,
-        searchNorm: normalizeText(`${g.logradouro} ${normalizeStreetKey(g.logradouro)} ${g.bairro} ${g.cidade}`),
+        searchNorm: normalizeText(
+          `${g.logradouro} ${normalizeStreetKey(g.logradouro)} ${g.bairro} ${g.cidade}`
+        ),
         onus: g.onus,
         plottedOnus,
         pons,
@@ -391,22 +494,31 @@ export default function MapComponent({
       });
     }
 
-    return items.sort((a, b) => b.onus.length - a.onus.length || a.logradouro.localeCompare(b.logradouro));
+    return items.sort(
+      (a, b) => b.onus.length - a.onus.length || a.logradouro.localeCompare(b.logradouro)
+    );
   }, [onus]);
 
-  // Filtra ruas conforme o termo digitado pelo usuário
+  // Filtra ruas ignorando divergências entre "Rua" e "Avenida" no cadastro do SGP
   const filteredStreets = useMemo(() => {
     const q = normalizeText(streetQuery);
     if (!q) return streetCatalog.slice(0, 40);
 
-    const tokens = q.split(" ").filter(Boolean);
+    const allTokens = q.split(" ").filter(Boolean);
+    const meaningfulTokens = allTokens.filter((t) => !STREET_STOPWORDS.has(t));
+    const tokensToUse = meaningfulTokens.length > 0 ? meaningfulTokens : allTokens;
+
     return streetCatalog
-      .filter((item) => tokens.every((t) => item.searchNorm.includes(t)))
+      .filter((item) => tokensToUse.every((t) => item.searchNorm.includes(t)))
       .slice(0, 50);
   }, [streetCatalog, streetQuery]);
 
   const selectedStreetItem = useMemo(() => {
-    if (!selectedStreetKey || selectedStreetKey === "__ALL_MATCHES__" || selectedStreetKey === "__OSM__") {
+    if (
+      !selectedStreetKey ||
+      selectedStreetKey === "__ALL_MATCHES__" ||
+      selectedStreetKey === "__OSM__"
+    ) {
       return null;
     }
     return streetCatalog.find((s) => s.key === selectedStreetKey) ?? null;
@@ -444,9 +556,8 @@ export default function MapComponent({
     setIsSearchingOsm(true);
     setOsmResults([]);
     try {
-      // Usa a cidade mais comum do escopo atual para refinar a busca no OpenStreetMap
-      const mainCity = streetCatalog.find((s) => s.cidade)?.cidade || "Paraíba";
-      const qParam = `${query}, ${mainCity}, Brasil`;
+      const mainCity = streetCatalog.find((s) => s.cidade)?.cidade || "João Pessoa";
+      const qParam = `${query}, ${mainCity}, Paraíba, Brasil`;
       const res = await fetch(
         `https://nominatim.openstreetmap.org/search?format=json&limit=4&countrycodes=br&q=${encodeURIComponent(
           qParam
@@ -495,9 +606,13 @@ export default function MapComponent({
       onusInside = plotted.filter(
         (o) => centerLatLng.distanceTo(L.latLng(o.lat, o.lng)) <= circleRadius
       );
+      streetTitle = `Raio de ${circleRadius}m`;
+      streetSubtitle = `Centro: ${circleCenter[0].toFixed(5)}, ${circleCenter[1].toFixed(5)}`;
     } else if (areaMode === "poligono") {
       if (polygonPoints.length < 3) return null;
       onusInside = plotted.filter((o) => isPointInPolygon([o.lat, o.lng], polygonPoints));
+      streetTitle = `Polígono Demarcado (${polygonPoints.length} vértices)`;
+      streetSubtitle = "Análise de área personalizada";
     } else if (areaMode === "rua") {
       if (selectedStreetKey === "__OSM__" && osmLocation) {
         const centerLatLng = L.latLng(osmLocation.lat, osmLocation.lng);
@@ -516,7 +631,7 @@ export default function MapComponent({
         }
         const baseList = Array.from(baseMap.values());
         onusInside = [...baseList];
-        streetTitle = `Busca: "${streetQuery.trim()}"`;
+        streetTitle = streetQuery.trim().toUpperCase();
         streetSubtitle = `${filteredStreets.length} logradouro(s) correspondente(s)`;
 
         if (streetBufferRadius > 0) {
@@ -680,34 +795,78 @@ export default function MapComponent({
     osmLocation,
   ]);
 
-  if (!isMounted) {
-    return (
-      <div className="h-full w-full bg-[#000000] flex items-center justify-center">
-        <div className="w-10 h-10 border-4 border-[#EB6410] border-t-transparent rounded-full animate-spin"></div>
-      </div>
-    );
-  }
+  const handleSelectOnuPopup = useCallback((onu: OnuData & { lat: number; lng: number }) => {
+    setActivePopupOnu(onu);
+  }, []);
 
-  // Verde online, vermelho offline, âmbar quando o sinal está fraco.
-  const createCustomIcon = (
-    online: boolean,
-    infoRx: number | undefined,
-    aproximado: boolean,
-    destacado: boolean
-  ) => {
-    let color = "#10b981";
-    if (!online) color = "#ef4444";
-    else if (infoRx !== undefined && infoRx < -25) color = "#f59e0b";
-
-    const border = aproximado ? "3px dashed #DFDAC6" : "3px solid #FFFFFF";
-    const ring = destacado ? "box-shadow: 0 0 0 4px rgba(235, 100, 16, 0.9);" : "";
-
-    return L.divIcon({
-      className: "custom-div-icon",
-      html: `<div style="background-color:${color};width:18px;height:18px;border-radius:50%;border:${border};${ring}"></div>`,
-      iconSize: [18, 18],
-      iconAnchor: [9, 9],
+  const buildReportBlob = async () => {
+    if (!areaSelection) return null;
+    return generateDiagnosticPngBlob({
+      mode: areaMode,
+      title: areaSelection.streetTitle || "Diagnóstico de Rede FTTH",
+      subtitle: areaSelection.streetSubtitle,
+      totalClients: areaSelection.onusInside.length,
+      onlineTotal: areaSelection.onlineTotal,
+      offlineTotal: areaSelection.offlineTotal,
+      weakSignalTotal: areaSelection.weakSignalTotal,
+      semPinTotal: areaSelection.semPinTotal,
+      pons: areaSelection.pons,
+      ctos: areaSelection.ctosSummary,
+      clients: areaSelection.onusInside,
     });
+  };
+
+  const handleDownloadPng = async () => {
+    if (!areaSelection || isGeneratingPng) return;
+    setIsGeneratingPng(true);
+    try {
+      const blob = await buildReportBlob();
+      if (!blob) return;
+      const slug =
+        normalizeText(areaSelection.streetTitle || "diagnostico").replace(/\s+/g, "-") ||
+        "diagnostico";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `relatorio-ftth-${slug}.png`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.warn("Falha ao gerar PNG:", err);
+    } finally {
+      setIsGeneratingPng(false);
+    }
+  };
+
+  const handleCopyPng = async () => {
+    if (!areaSelection || isGeneratingPng) return;
+    setIsGeneratingPng(true);
+    try {
+      const blob = await buildReportBlob();
+      if (!blob) return;
+      if (navigator.clipboard && typeof ClipboardItem !== "undefined") {
+        await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+        setCopiedPng(true);
+        setTimeout(() => setCopiedPng(false), 2500);
+      } else {
+        await handleDownloadPng();
+      }
+    } catch {
+      await handleDownloadPng();
+    } finally {
+      setIsGeneratingPng(false);
+    }
+  };
+
+  const openStreetMode = () => {
+    setAreaMode("rua");
+    setAreaToolActive(true);
+    // Para encontrar qualquer rua da base e todas as PONs que a atendem, garante a visão de toda a rede
+    if (escopo && escopo !== "tudo" && onChangeEscopo) {
+      onChangeEscopo("tudo");
+    }
   };
 
   const handleCloseTool = () => {
@@ -719,6 +878,14 @@ export default function MapComponent({
     setOsmResults([]);
     setShowClientList(false);
   };
+
+  if (!isMounted) {
+    return (
+      <div className="h-full w-full bg-[#000000] flex items-center justify-center">
+        <div className="w-10 h-10 border-4 border-[#EB6410] border-t-transparent rounded-full animate-spin"></div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -744,10 +911,7 @@ export default function MapComponent({
             </button>
 
             <button
-              onClick={() => {
-                setAreaMode("rua");
-                setAreaToolActive(true);
-              }}
+              onClick={openStreetMode}
               className="flex items-center gap-2 bg-[#000000]/90 hover:bg-[#333333] text-[#FFFFFF] text-xs font-bold px-3.5 py-2.5 rounded-xl shadow-lg border border-[#EB6410]/60 hover:border-[#EB6410] transition-all cursor-pointer"
             >
               <Route className="w-4 h-4 text-[#EB6410]" />
@@ -799,9 +963,7 @@ export default function MapComponent({
                   <Pentagon className="w-3.5 h-3.5" /> Polígono
                 </button>
                 <button
-                  onClick={() => {
-                    setAreaMode("rua");
-                  }}
+                  onClick={openStreetMode}
                   className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all cursor-pointer ${
                     areaMode === "rua"
                       ? "bg-[#EB6410] text-[#FFFFFF]"
@@ -898,6 +1060,15 @@ export default function MapComponent({
             ) : (
               /* Modo Rua */
               <div className="space-y-2.5">
+                {aquecendo?.rodando && (
+                  <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-xl bg-[#EB6410]/10 border border-[#EB6410]/30 text-[11px] text-[#DFDAC6]">
+                    <Loader2 className="w-3.5 h-3.5 text-[#EB6410] animate-spin shrink-0" />
+                    <span>
+                      Sincronizando ruas da rede ({aquecendo.feitos}/{aquecendo.total})...
+                    </span>
+                  </div>
+                )}
+
                 {/* Campo de busca de rua */}
                 <div className="relative">
                   <Search className="w-3.5 h-3.5 text-[#EB6410] absolute left-3 top-1/2 -translate-y-1/2" />
@@ -935,7 +1106,7 @@ export default function MapComponent({
                       <span>
                         {streetQuery.trim()
                           ? `Ruas encontradas (${filteredStreets.length})`
-                          : `Principais ruas no filtro (${streetCatalog.length})`}
+                          : `Principais ruas carregadas (${streetCatalog.length})`}
                       </span>
                       <span>PONs / Clientes</span>
                     </div>
@@ -947,7 +1118,8 @@ export default function MapComponent({
                       >
                         <span className="flex items-center gap-1.5 truncate">
                           <Sparkles className="w-3.5 h-3.5 text-[#EB6410] shrink-0" />
-                          Analisar todas as {filteredStreets.length} ruas para &ldquo;{streetQuery.trim()}&rdquo;
+                          Analisar todas as {filteredStreets.length} ruas para &ldquo;
+                          {streetQuery.trim()}&rdquo;
                         </span>
                         <span className="text-[#EB6410] shrink-0 ml-2">
                           {filteredStreets.reduce((acc, s) => acc + s.onus.length, 0)} ONUs
@@ -958,7 +1130,9 @@ export default function MapComponent({
                     {filteredStreets.length === 0 ? (
                       <div className="bg-[#333333]/25 border border-[#333333] rounded-xl p-3 text-center space-y-2">
                         <p className="text-xs text-[#D2D2D2]">
-                          Nenhuma rua cadastrada no SGP com <strong className="text-[#FFFFFF]">&ldquo;{streetQuery}&rdquo;</strong> neste filtro.
+                          {aquecendo?.rodando
+                            ? "Ainda carregando os endereços da rede no SGP, aguarde alguns segundos..."
+                            : `Nenhuma rua cadastrada no SGP com “${streetQuery}” neste filtro.`}
                         </p>
                         {streetQuery.trim().length >= 3 && (
                           <button
@@ -1017,7 +1191,7 @@ export default function MapComponent({
                       </div>
                     )}
 
-                    {/* Botão opcional para buscar por GPS no OpenStreetMap mesmo quando há resultados */}
+                    {/* Botão opcional para buscar por GPS no OpenStreetMap */}
                     {streetQuery.trim().length >= 3 && filteredStreets.length > 0 && (
                       <div className="pt-1 flex items-center justify-between gap-2">
                         <button
@@ -1030,7 +1204,7 @@ export default function MapComponent({
                           ) : (
                             <MapPin className="w-3 h-3 text-[#EB6410]" />
                           )}
-                          Não achou? Buscar endereço no mapa (GPS)
+                          Buscar endereço no mapa (GPS)
                         </button>
                       </div>
                     )}
@@ -1165,24 +1339,39 @@ export default function MapComponent({
 
       {/* Card de Resultado da Área ou Rua Selecionada */}
       {areaSelection && (
-        <div className="absolute bottom-3 left-3 right-3 sm:left-auto sm:right-3 sm:top-16 sm:bottom-auto z-[1000] sm:w-88 bg-[#000000]/95 backdrop-blur-md border border-[#EB6410]/50 rounded-2xl p-3.5 shadow-2xl text-[#FFFFFF] max-h-[62vh] flex flex-col gap-3 overflow-y-auto custom-scrollbar">
-          {/* Cabeçalho da Rua quando em modo Rua */}
-          {areaMode === "rua" && areaSelection.streetTitle && (
-            <div className="pb-2 border-b border-[#333333] flex items-start justify-between gap-2">
+        <div className="absolute bottom-3 left-3 right-3 sm:left-auto sm:right-3 sm:top-16 sm:bottom-auto z-[1000] sm:w-88 bg-[#000000]/95 backdrop-blur-md border border-[#EB6410]/50 rounded-2xl p-3.5 shadow-2xl text-[#FFFFFF] max-h-[68vh] flex flex-col gap-3 overflow-y-auto custom-scrollbar">
+          {/* Cabeçalho do Diagnóstico + Botões de Exportar PNG */}
+          <div className="pb-2.5 border-b border-[#333333] space-y-2">
+            <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <div className="flex items-center gap-1.5 text-[10px] font-extrabold uppercase tracking-wider text-[#EB6410]">
-                  <Route className="w-3.5 h-3.5 shrink-0" />
-                  Diagnóstico da Rua
+                  {areaMode === "rua" ? (
+                    <>
+                      <Route className="w-3.5 h-3.5 shrink-0" />
+                      Diagnóstico da Rua
+                    </>
+                  ) : (
+                    <>
+                      <Radar className="w-3.5 h-3.5 shrink-0" />
+                      Diagnóstico da Área
+                    </>
+                  )}
                 </div>
-                <h4 className="text-sm font-extrabold text-[#FFFFFF] truncate mt-0.5" title={areaSelection.streetTitle}>
-                  {areaSelection.streetTitle}
-                </h4>
+                {areaSelection.streetTitle && (
+                  <h4
+                    className="text-sm font-extrabold text-[#FFFFFF] truncate mt-0.5"
+                    title={areaSelection.streetTitle}
+                  >
+                    {areaSelection.streetTitle}
+                  </h4>
+                )}
                 {areaSelection.streetSubtitle && (
                   <p className="text-[11px] text-[#DFDAC6] truncate">
                     {areaSelection.streetSubtitle}
                   </p>
                 )}
               </div>
+
               {areaSelection.plottedInside.length > 0 && (
                 <button
                   onClick={() =>
@@ -1194,13 +1383,51 @@ export default function MapComponent({
                     })
                   }
                   className="shrink-0 px-2 py-1 rounded-lg bg-[#333333]/50 hover:bg-[#333333] border border-[#333333] text-[10px] font-bold text-[#DFDAC6] hover:text-[#FFFFFF] flex items-center gap-1 cursor-pointer"
-                  title="Centralizar rua no mapa"
+                  title="Centralizar no mapa"
                 >
                   <MapPin className="w-3 h-3 text-[#EB6410]" /> Focar
                 </button>
               )}
             </div>
-          )}
+
+            {/* Botões de Relatório PNG para envio ao Técnico em Campo */}
+            {areaSelection.onusInside.length > 0 && (
+              <div className="grid grid-cols-2 gap-2 pt-0.5">
+                <button
+                  onClick={handleDownloadPng}
+                  disabled={isGeneratingPng}
+                  className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-gradient-to-r from-[#EB6410] to-[#E84818] hover:brightness-110 text-[#FFFFFF] text-[11px] font-bold shadow-sm transition-all cursor-pointer disabled:opacity-50"
+                  title="Baixar imagem PNG com o resumo completo para enviar ao técnico"
+                >
+                  {isGeneratingPng ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Download className="w-3.5 h-3.5" />
+                  )}
+                  Baixar PNG
+                </button>
+
+                <button
+                  onClick={handleCopyPng}
+                  disabled={isGeneratingPng}
+                  className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-[#333333]/60 hover:bg-[#333333] border border-[#EB6410]/40 text-[#DFDAC6] hover:text-[#FFFFFF] text-[11px] font-bold transition-all cursor-pointer disabled:opacity-50"
+                  title="Copiar imagem PNG para colar direto no WhatsApp"
+                >
+                  {copiedPng ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span className="text-emerald-400">Copiado!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5 text-[#EB6410]" />
+                      Copiar PNG
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
 
           {/* Resumo de Clientes e PONs */}
           <div className="grid grid-cols-2 gap-2">
@@ -1219,7 +1446,10 @@ export default function MapComponent({
                 {areaSelection.weakSignalTotal > 0 && (
                   <>
                     <span className="text-[#333333]">&bull;</span>
-                    <span className="text-amber-400" title="Clientes online com sinal RX abaixo de -25 dBm">
+                    <span
+                      className="text-amber-400"
+                      title="Clientes online com sinal RX abaixo de -25 dBm"
+                    >
                       {areaSelection.weakSignalTotal} fraco
                     </span>
                   </>
@@ -1243,21 +1473,24 @@ export default function MapComponent({
             </div>
           </div>
 
-          {/* Avisos úteis de precisão (ex: clientes na rua sem pino GPS ou vizinhos por proximidade) */}
-          {areaMode === "rua" && (areaSelection.semPinTotal > 0 || areaSelection.proximityAddedCount > 0) && (
-            <div className="text-[11px] bg-[#333333]/30 border border-[#333333] rounded-xl px-2.5 py-1.5 text-[#DFDAC6] space-y-0.5">
-              {areaSelection.semPinTotal > 0 && (
-                <div>
-                  ℹ️ <strong>{areaSelection.semPinTotal}</strong> cliente(s) desta rua não têm coordenada GPS, mas estão contabilizados nas PONs acima.
-                </div>
-              )}
-              {areaSelection.proximityAddedCount > 0 && (
-                <div>
-                  📍 Inclui <strong>+{areaSelection.proximityAddedCount}</strong> cliente(s) próximo(s) no raio de +{streetBufferRadius}m.
-                </div>
-              )}
-            </div>
-          )}
+          {/* Avisos úteis de precisão */}
+          {areaMode === "rua" &&
+            (areaSelection.semPinTotal > 0 || areaSelection.proximityAddedCount > 0) && (
+              <div className="text-[11px] bg-[#333333]/30 border border-[#333333] rounded-xl px-2.5 py-1.5 text-[#DFDAC6] space-y-0.5">
+                {areaSelection.semPinTotal > 0 && (
+                  <div>
+                    ℹ️ <strong>{areaSelection.semPinTotal}</strong> cliente(s) desta rua não têm
+                    coordenada GPS, mas estão contabilizados nas PONs acima.
+                  </div>
+                )}
+                {areaSelection.proximityAddedCount > 0 && (
+                  <div>
+                    📍 Inclui <strong>+{areaSelection.proximityAddedCount}</strong> cliente(s)
+                    próximo(s) no raio de +{streetBufferRadius}m.
+                  </div>
+                )}
+              </div>
+            )}
 
           {/* Lista detalhada de PONs que atendem a rua / área */}
           <div className="space-y-1.5">
@@ -1285,7 +1518,9 @@ export default function MapComponent({
                       onClick={() => onSelectPon?.(p.slot, p.pon)}
                       title={onSelectPon ? "Clique para filtrar apenas esta PON" : undefined}
                       className={`bg-[#333333]/30 border border-[#333333] rounded-xl px-2.5 py-2 text-xs space-y-1.5 ${
-                        onSelectPon ? "hover:border-[#EB6410] cursor-pointer transition-colors" : ""
+                        onSelectPon
+                          ? "hover:border-[#EB6410] cursor-pointer transition-colors"
+                          : ""
                       }`}
                     >
                       <div className="flex items-center justify-between">
@@ -1302,7 +1537,10 @@ export default function MapComponent({
                             <span className="text-rose-400">{p.offline} off</span>
                           )}
                           {p.weakSignal > 0 && (
-                            <span className="text-amber-400 flex items-center gap-0.5" title="Sinal fraco">
+                            <span
+                              className="text-amber-400 flex items-center gap-0.5"
+                              title="Sinal fraco"
+                            >
                               <Signal className="w-3 h-3" />
                               {p.weakSignal}
                             </span>
@@ -1324,7 +1562,8 @@ export default function MapComponent({
                       {/* CTOs vinculadas a esta PON na rua */}
                       {p.ctos.length > 0 && (
                         <div className="text-[10px] text-[#DFDAC6]/80 truncate">
-                          CTOs: <span className="text-[#FFFFFF] font-medium">{p.ctos.join(", ")}</span>
+                          CTOs:{" "}
+                          <span className="text-[#FFFFFF] font-medium">{p.ctos.join(", ")}</span>
                         </div>
                       )}
                     </div>
@@ -1392,7 +1631,9 @@ export default function MapComponent({
                         key={`area-onu-${o.id}`}
                         onClick={() => {
                           if (o.lat !== null && o.lng !== null) {
+                            const withCoords = o as OnuData & { lat: number; lng: number };
                             setFocusTarget({ point: [o.lat, o.lng], seq: Date.now() });
+                            setActivePopupOnu(withCoords);
                           }
                         }}
                         title={
@@ -1401,7 +1642,9 @@ export default function MapComponent({
                             : "Cliente sem coordenada GPS no SGP"
                         }
                         className={`flex items-center justify-between gap-2 text-[11px] bg-[#333333]/30 border border-[#333333] rounded-lg px-2 py-1.5 ${
-                          hasCoords ? "hover:border-[#EB6410]/60 cursor-pointer transition-colors" : "opacity-80"
+                          hasCoords
+                            ? "hover:border-[#EB6410]/60 cursor-pointer transition-colors"
+                            : "opacity-80"
                         }`}
                       >
                         <div className="min-w-0 flex-1">
@@ -1416,22 +1659,28 @@ export default function MapComponent({
                             </span>
                           </div>
                           <div className="text-[10px] text-[#D2D2D2]/80 pl-3.5 flex items-center gap-1.5 truncate">
-                            {numero && <span className="text-[#DFDAC6] font-semibold">{numero}</span>}
+                            {numero && (
+                              <span className="text-[#DFDAC6] font-semibold">{numero}</span>
+                            )}
                             {o.cto && (
                               <span>
                                 {o.cto}
                                 {o.ctoport ? `/P${o.ctoport}` : ""}
                               </span>
                             )}
-                            {o.info_rx !== undefined && o.info_rx !== null && o.info_rx !== 0 && (
-                              <span
-                                className={
-                                  o.info_rx < -25 ? "text-amber-400 font-semibold" : "text-emerald-400"
-                                }
-                              >
-                                {o.info_rx} dBm
-                              </span>
-                            )}
+                            {o.info_rx !== undefined &&
+                              o.info_rx !== null &&
+                              o.info_rx !== 0 && (
+                                <span
+                                  className={
+                                    o.info_rx < -25
+                                      ? "text-amber-400 font-semibold"
+                                      : "text-emerald-400"
+                                  }
+                                >
+                                  {o.info_rx} dBm
+                                </span>
+                              )}
                           </div>
                         </div>
                         <span className="text-[10px] font-mono font-bold text-[#EB6410] bg-[#EB6410]/10 border border-[#EB6410]/30 px-1.5 py-0.5 rounded shrink-0">
@@ -1468,7 +1717,7 @@ export default function MapComponent({
         />
 
         <InvalidateMapSize trigger={isFullscreen} />
-        <FitBounds points={bounds} disabled={areaToolActive} />
+        <FitBounds points={bounds} disabled={areaToolActive} scopeKey={scopeKey} />
         <MapFocusController target={focusTarget} />
 
         <AreaClickHandler
@@ -1562,7 +1811,7 @@ export default function MapComponent({
               <CircleMarker
                 key={`street-halo-${o.id}`}
                 center={[o.lat, o.lng]}
-                radius={15}
+                radius={14}
                 pathOptions={{
                   color: "#EB6410",
                   weight: 2,
@@ -1574,98 +1823,118 @@ export default function MapComponent({
           </>
         )}
 
-        {plotted.map((onu) => {
-          const online = isOnline(onu);
-          const aproximado = onu.coordSource === "cto";
-          const destacado = areaSelection?.selectedIds.has(onu.id) ?? false;
+        {/* Camada Ultra-Leve em Canvas para todos os pontos da rede */}
+        <OnuCanvasLayer
+          plotted={plotted}
+          selectedIds={areaSelection?.selectedIds ?? null}
+          hasActiveSelection={areaSelection !== null}
+          compact={escopo === "tudo" && plotted.length > 250}
+          onSelectOnu={handleSelectOnuPopup}
+        />
 
-          return (
-            <Marker
-              key={onu.id}
-              position={[onu.lat, onu.lng]}
-              icon={createCustomIcon(online, onu.info_rx, aproximado, destacado)}
-            >
-              <Popup className="custom-popup">
-                <div className="p-1 min-w-[220px]">
-                  <div className="flex items-center gap-2 mb-1 pb-2 border-b border-slate-200">
-                    <div className={`w-2.5 h-2.5 rounded-full ${!online ? "bg-red-500" : "bg-emerald-500"}`} />
-                    <h3 className="font-bold text-slate-900 text-base leading-none">
-                      {onu.service_cliente || "Sem Nome Definido"}
-                    </h3>
-                  </div>
+        {/* Popup único sob demanda (evita montar 3.000 árvores DOM simultâneas) */}
+        {activePopupOnu && (
+          <Popup
+            position={[activePopupOnu.lat, activePopupOnu.lng]}
+            eventHandlers={{
+              remove: () => setActivePopupOnu(null),
+            }}
+            className="custom-popup"
+          >
+            <div className="p-1 min-w-[220px]">
+              <div className="flex items-center gap-2 mb-1 pb-2 border-b border-slate-200">
+                <div
+                  className={`w-2.5 h-2.5 rounded-full ${
+                    !isOnline(activePopupOnu) ? "bg-red-500" : "bg-emerald-500"
+                  }`}
+                />
+                <h3 className="font-bold text-slate-900 text-base leading-none">
+                  {activePopupOnu.service_cliente || "Sem Nome Definido"}
+                </h3>
+              </div>
 
-                  {onu.enderecoLinha && (
-                    <div className="mt-2 text-xs text-slate-700 leading-snug">
-                      {onu.enderecoLinha}
-                      {onu.address?.pontoreferencia && (
-                        <div className="text-slate-500 italic mt-0.5">
-                          Ref.: {onu.address.pontoreferencia}
-                        </div>
-                      )}
+              {activePopupOnu.enderecoLinha && (
+                <div className="mt-2 text-xs text-slate-700 leading-snug">
+                  {activePopupOnu.enderecoLinha}
+                  {activePopupOnu.address?.pontoreferencia && (
+                    <div className="text-slate-500 italic mt-0.5">
+                      Ref.: {activePopupOnu.address.pontoreferencia}
                     </div>
                   )}
-
-                  {aproximado && (
-                    <div className="mt-2 text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
-                      Posição aproximada (da CTO)
-                    </div>
-                  )}
-
-                  <div className="space-y-2 mt-2 text-sm">
-                    <div className="flex justify-between items-center">
-                      <span className="text-slate-500 font-medium">OLT/PON:</span>
-                      <span className="font-semibold text-slate-800">{onu.olt_id} / {onu.pon}</span>
-                    </div>
-
-                    <div className="flex justify-between items-center">
-                      <span className="text-slate-500 font-medium">Slot:</span>
-                      <span className="font-semibold text-slate-800">{onu.slot}</span>
-                    </div>
-
-                    {onu.cto && (
-                      <div className="flex justify-between items-center">
-                        <span className="text-slate-500 font-medium">CTO:</span>
-                        <span className="font-semibold text-slate-800 text-xs text-right">
-                          {onu.cto}{onu.ctoport ? ` / P${onu.ctoport}` : ""}
-                        </span>
-                      </div>
-                    )}
-
-                    <div className="flex justify-between items-center">
-                      <span className="text-slate-500 font-medium">MAC:</span>
-                      <span className="font-mono text-xs text-slate-700 bg-slate-100 px-1 py-0.5 rounded">
-                        {onu.phy_addr}
-                      </span>
-                    </div>
-
-                    <div className="flex justify-between items-center">
-                      <span className="text-slate-500 font-medium">Sinal (RX):</span>
-                      <span className={`font-semibold ${onu.info_rx && onu.info_rx < -25 ? "text-amber-600" : "text-slate-800"}`}>
-                        {onu.info_rx ? `${onu.info_rx} dBm` : "N/A"}
-                      </span>
-                    </div>
-
-                    <div className="flex justify-between items-start pt-1">
-                      <span className="text-slate-500 font-medium mt-0.5">Observações:</span>
-                      <span className="text-xs text-slate-600 line-clamp-2 max-w-[130px] text-right" title={onu.notes}>
-                        {onu.notes || "Sem observações"}
-                      </span>
-                    </div>
-
-                    <a
-                      href={`https://www.google.com/maps/dir/?api=1&destination=${onu.lat},${onu.lng}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="block text-center mt-2 px-3 py-1.5 bg-gradient-to-r from-[#EB6410] to-[#E84818] hover:brightness-110 text-[#FFFFFF] text-xs font-bold rounded-lg transition-all"
-                    >
-                      Traçar rota
-                    </a>
-                  </div>
                 </div>
-              </Popup>
-            </Marker>
-          );
-        })}
+              )}
+
+              {activePopupOnu.coordSource === "cto" && (
+                <div className="mt-2 text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+                  Posição aproximada (da CTO)
+                </div>
+              )}
+
+              <div className="space-y-2 mt-2 text-sm">
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500 font-medium">OLT/PON:</span>
+                  <span className="font-semibold text-slate-800">
+                    {activePopupOnu.olt_id} / {activePopupOnu.pon}
+                  </span>
+                </div>
+
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500 font-medium">Slot:</span>
+                  <span className="font-semibold text-slate-800">{activePopupOnu.slot}</span>
+                </div>
+
+                {activePopupOnu.cto && (
+                  <div className="flex justify-between items-center">
+                    <span className="text-slate-500 font-medium">CTO:</span>
+                    <span className="font-semibold text-slate-800 text-xs text-right">
+                      {activePopupOnu.cto}
+                      {activePopupOnu.ctoport ? ` / P${activePopupOnu.ctoport}` : ""}
+                    </span>
+                  </div>
+                )}
+
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500 font-medium">MAC:</span>
+                  <span className="font-mono text-xs text-slate-700 bg-slate-100 px-1 py-0.5 rounded">
+                    {activePopupOnu.phy_addr}
+                  </span>
+                </div>
+
+                <div className="flex justify-between items-center">
+                  <span className="text-slate-500 font-medium">Sinal (RX):</span>
+                  <span
+                    className={`font-semibold ${
+                      activePopupOnu.info_rx && activePopupOnu.info_rx < -25
+                        ? "text-amber-600"
+                        : "text-slate-800"
+                    }`}
+                  >
+                    {activePopupOnu.info_rx ? `${activePopupOnu.info_rx} dBm` : "N/A"}
+                  </span>
+                </div>
+
+                <div className="flex justify-between items-start pt-1">
+                  <span className="text-slate-500 font-medium mt-0.5">Observações:</span>
+                  <span
+                    className="text-xs text-slate-600 line-clamp-2 max-w-[130px] text-right"
+                    title={activePopupOnu.notes}
+                  >
+                    {activePopupOnu.notes || "Sem observações"}
+                  </span>
+                </div>
+
+                <a
+                  href={`https://www.google.com/maps/dir/?api=1&destination=${activePopupOnu.lat},${activePopupOnu.lng}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block text-center mt-2 px-3 py-1.5 bg-gradient-to-r from-[#EB6410] to-[#E84818] hover:brightness-110 text-[#FFFFFF] text-xs font-bold rounded-lg transition-all"
+                >
+                  Traçar rota
+                </a>
+              </div>
+            </div>
+          </Popup>
+        )}
       </MapContainer>
     </div>
   );
